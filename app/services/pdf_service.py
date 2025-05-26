@@ -8,6 +8,9 @@ import os
 from datetime import datetime
 from PIL import Image
 import logging
+import time
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from ..config import get_settings
 from ..utils.logger import setup_logger
 
@@ -17,11 +20,24 @@ class PDFService:
         self.settings = get_settings()
         self.is_prod = is_prod
         self.logger = setup_logger("pdf_service", is_prod)
+
+        # Configure S3 client with retries and longer timeouts
+        config = Config(
+            retries=dict(
+                max_attempts=3,
+                mode='adaptive'
+            ),
+            connect_timeout=5,
+            read_timeout=10,
+            max_pool_connections=50
+        )
+
         self.s3_client = boto3.client(
             's3',
             aws_access_key_id=self.settings.AWS_ACCESS_KEY_ID,
             aws_secret_access_key=self.settings.AWS_SECRET_ACCESS_KEY,
-            region_name=self.settings.AWS_REGION
+            region_name=self.settings.AWS_REGION,
+            config=config
         )
         self.logger.info(
             f"Initialized PDFService for {'production' if is_prod else 'staging'} environment")
@@ -181,21 +197,57 @@ class PDFService:
             return None
 
     def upload_to_s3(self, file_data: BytesIO, bucket: str, key: str) -> Optional[str]:
-        """Upload file to S3 bucket"""
+        """Upload file to S3 bucket with retries and error handling"""
         self.logger.info(
             f"Uploading merged PDF to S3 bucket: {bucket}, key: {key}")
-        try:
-            self.s3_client.upload_fileobj(
-                file_data,
-                bucket,
-                key,
-                ExtraArgs={'ContentType': 'application/pdf'}
-            )
-            self.logger.info("File uploaded successfully to S3")
-            return key
-        except Exception as e:
-            self.logger.error(f"Error uploading to S3: {str(e)}")
-            return None
+
+        max_retries = 3
+        retry_delay = 1  # seconds
+
+        for attempt in range(max_retries):
+            try:
+                # Ensure file pointer is at the beginning
+                file_data.seek(0)
+
+                # Upload with retry configuration
+                self.s3_client.upload_fileobj(
+                    file_data,
+                    bucket,
+                    key,
+                    ExtraArgs={
+                        'ContentType': 'application/pdf',
+                        'ACL': 'private'
+                    }
+                )
+
+                self.logger.info("File uploaded successfully to S3")
+                return key
+
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code')
+                error_message = e.response.get('Error', {}).get('Message')
+
+                if error_code == 'RequestTimeTooSkewed':
+                    self.logger.warning(
+                        f"Time skew detected on attempt {attempt + 1}. Retrying...")
+                    # Exponential backoff
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+
+                self.logger.error(
+                    f"S3 upload error (attempt {attempt + 1}/{max_retries}): {error_code} - {error_message}")
+                if attempt == max_retries - 1:
+                    return None
+
+            except Exception as e:
+                self.logger.error(
+                    f"Unexpected error during S3 upload (attempt {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt == max_retries - 1:
+                    return None
+
+            time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+
+        return None
 
     def process_and_merge(self, urls: List[str], lead_id: str, is_prod: bool = False) -> Optional[str]:
         """Process URLs, merge PDFs, and upload to S3"""
@@ -224,10 +276,11 @@ class PDFService:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             s3_key = f"{lead_id}/merged_pdf/merged_document_{timestamp}.pdf"
 
-            # Upload to S3
+            # Upload to S3 with retries
             result = self.upload_to_s3(merged_pdf, bucket, s3_key)
             if not result:
-                raise ValueError("Failed to upload to S3")
+                raise ValueError(
+                    "Failed to upload to S3 after multiple attempts")
 
             self.logger.info(
                 f"Successfully processed merge request for lead_id: {lead_id}")
