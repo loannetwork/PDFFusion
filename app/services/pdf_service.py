@@ -1,18 +1,18 @@
 import boto3
 import requests
 from io import BytesIO
-from PyPDF2 import PdfMerger, PdfReader
-from typing import List, Tuple, Optional
+from PyPDF2 import PdfReader
+from typing import List, Optional, Tuple
 import tempfile
 import os
 from datetime import datetime
-from PIL import Image
 import logging
 import time
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from ..config import get_settings
 from ..utils.logger import setup_logger
+from PIL import Image
 
 
 class PDFService:
@@ -158,42 +158,98 @@ class PDFService:
             return None
 
     def merge_pdfs(self, pdf_files: List[BytesIO]) -> Optional[BytesIO]:
-        """Merge multiple PDF files in order"""
+        """
+        Merge multiple PDF files while preserving filled form field values using qpdf.
+
+        Args:
+            pdf_files (List[BytesIO]): List of PDF files to merge
+
+        Returns:
+            Optional[BytesIO]: Merged PDF file or None if merge fails
+        """
         if not pdf_files:
-            self.logger.error("No valid PDF files to merge")
+            self.logger.error("No PDF files provided")
             return None
 
         self.logger.info(f"Starting to merge {len(pdf_files)} PDF files")
+
         try:
-            merger = PdfMerger()
+            import tempfile
+            import subprocess
+            import os
+            import shutil
 
-            for i, pdf_file in enumerate(pdf_files, 1):
-                try:
-                    # Reset file pointer and validate again before merging
-                    pdf_file.seek(0)
-                    is_valid, error_msg = self.validate_pdf(pdf_file)
-                    if not is_valid:
-                        self.logger.warning(
-                            f"Skipping invalid PDF file at position {i}: {error_msg}")
-                        continue
-
-                    merger.append(pdf_file)
-                    self.logger.debug(f"Added PDF {i} to merger")
-                except Exception as e:
-                    self.logger.warning(f"Error processing PDF {i}: {str(e)}")
-                    continue
-
-            if len(merger.pages) == 0:
-                self.logger.error("No valid PDFs to merge")
+            # Check if qpdf is installed
+            if not shutil.which('qpdf'):
+                self.logger.error(
+                    "qpdf is not installed. Please install it using: sudo apt-get install qpdf")
                 return None
 
-            output = BytesIO()
-            merger.write(output)
-            output.seek(0)
-            self.logger.info("PDFs merged successfully")
-            return output
+            # Create temporary directory for PDF files
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # Save all PDFs to temporary files
+                temp_files = []
+                for i, pdf_file in enumerate(pdf_files, 1):
+                    try:
+                        # Reset file pointer
+                        pdf_file.seek(0)
+
+                        # Save to temporary file
+                        temp_path = os.path.join(temp_dir, f'input_{i}.pdf')
+                        with open(temp_path, 'wb') as f:
+                            f.write(pdf_file.read())
+                        temp_files.append(temp_path)
+
+                    except Exception as e:
+                        self.logger.warning(f"Error saving PDF {i}: {e}")
+                        continue
+
+                if not temp_files:
+                    self.logger.error("No valid PDFs to merge")
+                    return None
+
+                # Create output file path
+                output_path = os.path.join(temp_dir, 'merged.pdf')
+
+                # Build qpdf command
+                cmd = [
+                    'qpdf',
+                    '--empty',
+                    '--pages',
+                    *temp_files,
+                    '--',
+                    output_path,
+                    '--linearize',
+                    '--generate-appearances'
+                ]
+
+                # Execute qpdf command
+                try:
+                    self.logger.info(
+                        f"Executing qpdf command: {' '.join(cmd)}")
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+
+                    # Read the merged PDF
+                    with open(output_path, 'rb') as f:
+                        output = BytesIO(f.read())
+
+                    self.logger.info("PDFs merged successfully")
+                    return output
+
+                except subprocess.CalledProcessError as e:
+                    self.logger.error(f"qpdf command failed: {e.stderr}")
+                    return None
+                except Exception as e:
+                    self.logger.error(f"Error processing merged PDF: {e}")
+                    return None
+
         except Exception as e:
-            self.logger.error(f"Error merging PDFs: {str(e)}")
+            self.logger.error(f"Error during PDF merge: {e}")
             return None
 
     def upload_to_s3(self, file_data: BytesIO, bucket: str, key: str) -> Optional[str]:
@@ -202,12 +258,15 @@ class PDFService:
             f"Uploading merged PDF to S3 bucket: {bucket}, key: {key}")
 
         max_retries = 3
-        retry_delay = 1  # seconds
+        retry_delay = 2  # seconds
 
         for attempt in range(max_retries):
             try:
                 # Ensure file pointer is at the beginning
                 file_data.seek(0)
+
+                # Get current timestamp for S3
+                timestamp = datetime.utcnow()
 
                 # Upload with retry configuration
                 self.s3_client.upload_fileobj(
@@ -216,7 +275,10 @@ class PDFService:
                     key,
                     ExtraArgs={
                         'ContentType': 'application/pdf',
-                        'ACL': 'private'
+                        'ACL': 'private',
+                        'Metadata': {
+                            'upload-timestamp': timestamp.isoformat()
+                        }
                     }
                 )
 
@@ -229,9 +291,9 @@ class PDFService:
 
                 if error_code == 'RequestTimeTooSkewed':
                     self.logger.warning(
-                        f"Time skew detected on attempt {attempt + 1}. Retrying...")
-                    # Exponential backoff
-                    time.sleep(retry_delay * (attempt + 1))
+                        f"Time skew detected on attempt {attempt + 1}. Waiting before retry...")
+                    # Wait longer for time skew issues
+                    time.sleep(retry_delay * (attempt + 1) * 2)
                     continue
 
                 self.logger.error(
@@ -245,7 +307,7 @@ class PDFService:
                 if attempt == max_retries - 1:
                     return None
 
-            time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+            time.sleep(retry_delay * (attempt + 1))
 
         return None
 
